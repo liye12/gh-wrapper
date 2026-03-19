@@ -1,6 +1,6 @@
 # gh-wrapper
 
-A lightweight `gh` CLI wrapper that proxies GitHub CLI commands to the GitHub REST API via `curl`.
+A lightweight `gh` CLI wrapper — proxies GitHub CLI commands to the GitHub REST API via `curl`.
 
 ## Why
 
@@ -18,15 +18,13 @@ On some environments (restricted Linux containers), installing the official `gh`
 
 ## Setup
 
-### 1. Obtain a GitHub Personal Access Token (PAT)
+### 1. Obtain a GitHub Personal Access Token
 
 Generate a PAT at **GitHub → Settings → Developer Settings → Personal Access Tokens → Generate new token (classic)**.
 
 Required scopes: `repo`, `workflow`, `read:user`
 
-### 2. Set Your Token
-
-Export your token as an environment variable before running:
+### 2. Set Your Token as an Environment Variable
 
 ```bash
 export GITHUB_TOKEN="ghp_your_token_here"
@@ -42,6 +40,10 @@ chmod +x gh-wrapper
 ./gh-wrapper api /user
 ./gh-wrapper run list --repo owner/repo --limit 10
 ```
+
+## Extending
+
+The wrapper is a simple bash script. Add more commands following the existing `case` pattern.
 
 ## License
 
