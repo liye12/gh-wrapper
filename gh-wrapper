@@ -1,99 +1,443 @@
 #!/bin/bash
-# gh compatibility wrapper — proxies to GitHub REST API via curl
-# Set GITHUB_TOKEN env var before running
+# gh-wrapper — GitHub REST API via curl (no gh CLI needed)
+# Supports: auth, api, issue, pr, repo, run
+# ENV: GITHUB_TOKEN or TOKEN
 
-TOKEN="${GITHUB_TOKEN:-${TOKEN}}"
-API="https://api.github.com"
-AUTH="Authorization: token $TOKEN"
+set -euo pipefail
 
-cmd="$1"; shift || { echo "No command"; exit 1; }
+# ── Config ──────────────────────────────────────────────────────────────────
+TOKEN="${GITHUB_TOKEN:-${TOKEN:-}}"
+API_BASE="https://api.github.com"
+CONFIG_FILE="${XDG_CONFIG_HOME:-~/.config/gh-wrapper/config}"
 
-case "$cmd" in
-  auth)
-    if [ "$1" = "status" ]; then
-      curl -s -H "$AUTH" "$API/user" | python3 -c "
+# ── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; YEL='\033[0;33m'; GRN='\033[0;32m'; CYN='\033[0;36m'
+BLD='\033[1m'; RST='\033[0m'
+
+err()  { echo -e "${RED}Error:${RST} $*" >&2; }
+info() { echo -e "${CYN}[info]${RST} $*"; }
+die()  { err "$*"; exit 1; }
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+need_token() {
+  [[ -n "$TOKEN" ]] && return 0
+  err "No GitHub token set. Export GITHUB_TOKEN=<pat> before running."
+  exit 1
+}
+
+req() {
+  # $1 = method, $2 = path, $3+ = extra curl args
+  local method="$1"; local path="$2"; shift 2
+  curl -s -L -X "$method" \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github.v3+json" \
+    -H "User-Agent: gh-wrapper/1.0" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$@" \
+    "${API_BASE}${path}"
+}
+
+jq_() {
+  # Fallback: if jq unavailable, dump raw; else format
+  if command -v jq &>/dev/null; then
+    jq -r "$1" 2>/dev/null || cat
+  else
+    python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d)
+except: print(sys.stdin.read())
+" 2>/dev/null || cat
+  fi
+}
+
+err_check() {
+  # Check response for GitHub API errors; $1 = HTTP code, $2 = body
+  local code="$1"; local body="$2"
+  case "$code" in
+    401) die "Auth failed — bad or expired token." ;;
+    403) die "Forbidden — check token scopes (needs repo, workflow, read:user)." ;;
+    404) die "Not found — check the path / repo name." ;;
+    422) die "Unprocessable — invalid input.\n$body" ;;
+    5*)  die "GitHub server error ($code). Try again later." ;;
+  esac
+}
+
+# ── Load config ───────────────────────────────────────────────────────────────
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+cmd_auth() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    status|"" )
+      need_token
+      local out; out=$(req GET /user)
+      local http_code
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/user")
+      err_check "$http_code" "$out"
+      python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-print('Logged in as @'+d['login']+' ('+str(d.get('name','no name'))+')')
-print('Type: '+d.get('type','User'))
+print(d['login'] + ' (' + d.get('name','no name') + ')')
+print('Type: ' + d.get('type','User'))
+print('Plan: ' + d.get('plan',{}).get('name','none'))
 "
-    fi
-    ;;
+      ;;
+    logout)
+      unset GITHUB_TOKEN TOKEN
+      info "Token cleared from environment."
+      ;;
+    *) usage ;;
+  esac
+}
 
-  api)
-    path="$1"; shift
-    curl -s -H "$AUTH" "${API}${path}" "$@"
-    ;;
+cmd_api() {
+  local path="${1:-}"; shift || die "Usage: gh-wrapper api <path> [curl flags...]"
+  [[ "$path" == /* ]] || die "Path must start with / (e.g. /user)"
+  need_token
+  local http_code body
+  http_code=$(curl -s -o >(body=$(cat); typeset -g body="$body") -w "%{http_code}" \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github.v3+json" \
+    -L -X GET "$@" "${API_BASE}${path}")
+  err_check "$http_code" "$body"
+  # Pretty-print JSON if jq available, else raw
+  if command -v jq &>/dev/null; then
+    echo "$body" | jq . 2>/dev/null || echo "$body"
+  else
+    echo "$body"
+  fi
+}
 
-  pr)
-    sub="$1"; shift
-    case "$sub" in
-      checks)
-        PR_NUM="" REPO=""
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --repo) REPO="$2"; shift 2 ;;
-            *) PR_NUM="$1"; shift ;;
-          esac
-        done
-        [ -z "$REPO" ] && echo "Error: --repo required" && exit 1
-        curl -s -H "$AUTH" "${API}/repos/${REPO}/pulls/${PR_NUM}/checks" | python3 -c "
+cmd_issue() {
+  local sub="${1:-}"; shift || die "Usage: gh-wrapper issue <subcommand>"
+  case "$sub" in
+    list)
+      local repo="" state="open" limit="20"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          --state) state="$2"; shift 2 ;;
+          --limit) limit="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      [[ -n "$repo" ]] || die "gh issue list: --repo required (owner/repo)"
+      local out http_code
+      out=$(req GET "/repos/${repo}/issues?state=${state}&per_page=${limit}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/issues?state=${state}&per_page=${limit}")
+      err_check "$http_code" "$out"
+      echo -e "${BLD}${state} issues in ${repo}${RST}"
+      echo "$out" | python3 -c "
+import sys,json
+for i in json.load(sys.stdin):
+    if 'pull_request' in i: continue
+    num=i['number']; title=i['title']; lbls=','.join([l['name'] for l in i.get('labels',[])])
+    by=i['user']['login']; st=i['state']
+    print(f'  #{num} [{st}] {title}  (by @{by})  labels:{lbls}')
+"
+      ;;
+    view)
+      local repo="" num=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          *) num="$1"; shift ;;
+        esac
+      done
+      [[ -n "$repo" ]] || die "gh issue view: --repo required"
+      [[ -n "$num" ]]  || die "Usage: gh issue view <number> --repo owner/repo"
+      local out http_code
+      out=$(req GET "/repos/${repo}/issues/${num}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/issues/${num}")
+      err_check "$http_code" "$out"
+      echo "$out" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-for c in d.get('check_runs',[]):
-    print(c['name']+': '+(c.get('conclusion') or 'pending'))
+print(d['title'])
+print('─'*60)
+print(d['body'] or '(no description)')
+print('─'*60)
+print(f'Author: @{d[\"user\"][\"login\"]}  State: {d[\"state\"]}  Labels: {','.join([l[\"name\"] for l in d.get(\"labels\",[])])}')
+print(f'URL: {d[\"html_url\"]}')
 "
-        ;;
-      *) echo "gh pr $sub: not implemented" ;;
-    esac
-    ;;
+      ;;
+    create)
+      local repo="" title="" body="" labels=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          --title) title="$2"; shift 2 ;;
+          --body) body="$2"; shift 2 ;;
+          --label) labels+=("$2"); shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      [[ -n "$repo" ]]  || die "gh issue create: --repo required"
+      [[ -n "$title" ]] || die "gh issue create: --title required"
+      local payload
+      payload=$(python3 -c "import sys,json; print(json.dumps({'title': '''$title''', 'body': '''$body''', 'labels': '''${labels[*]}'''}))")
+      local out http_code
+      http_code=$(curl -s -o >(out=$(cat); typeset -g out="$out") -w "%{http_code}" \
+        -H "Authorization: token $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "${API_BASE}/repos/${repo}/issues")
+      err_check "$http_code" "$out"
+      echo -e "${GRN}✓ Issue created:${RST} $(echo "$out" | python3 -c 'import sys,json;print(json.load(sys.stdin)["html_url"])')"
+      ;;
+    *) usage ;;
+  esac
+}
 
-  run)
-    sub="$1"; shift
-    case "$sub" in
-      list)
-        REPO="" LIMIT="10"
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --repo) REPO="$2"; shift 2 ;;
-            --limit) LIMIT="$2"; shift 2 ;;
-            *) shift ;;
-          esac
-        done
-        [ -z "$REPO" ] && echo "Error: --repo required" && exit 1
-        curl -s -H "$AUTH" "${API}/repos/${REPO}/actions/runs?per_page=${LIMIT}" | python3 -c "
+cmd_pr() {
+  local sub="${1:-}"; shift || die "Usage: gh-wrapper pr <subcommand>"
+  case "$sub" in
+    list)
+      local repo="" state="open" limit="20"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          --state) state="$2"; shift 2 ;;
+          --limit) limit="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      [[ -n "$repo" ]] || die "gh pr list: --repo required"
+      local out http_code
+      out=$(req GET "/repos/${repo}/pulls?state=${state}&per_page=${limit}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/pulls?state=${state}&per_page=${limit}")
+      err_check "$http_code" "$out"
+      echo -e "${BLD}PRs (${state}) in ${repo}${RST}"
+      echo "$out" | python3 -c "
+import sys,json
+for p in json.load(sys.stdin):
+    num=p['number']; t=p['title']; st=p['state']; br=p['head']['ref']
+    by=p['user']['login']; draft=p.get('draft',False)
+    d='[DRAFT]' if draft else ''
+    print(f'  #{num} {d} {t}')
+    print(f'    {br} ← {p[\"base\"][\"ref\"]}  by @{by}  ({st})')
+"
+      ;;
+    checks)
+      local repo="" pr_num=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          *) pr_num="$1"; shift ;;
+        esac
+      done
+      [[ -n "$repo" ]]   || die "gh pr checks: --repo required"
+      [[ -n "$pr_num" ]] || die "Usage: gh pr checks <number> --repo owner/repo"
+      local out http_code
+      out=$(req GET "/repos/${repo}/pulls/${pr_num}/checks" 2>/dev/null \
+        || req GET "/repos/${repo}/commits")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/pulls/${pr_num}/checks")
+      # Fallback to status checks for older APIs
+      out=$(req GET "/repos/${repo}/commits?per_page=1")
+      echo -e "${BLD}PR #${pr_num} checks${RST}"
+      curl -s -H "Authorization: token $TOKEN" \
+        "${API_BASE}/repos/${repo}/commits?per_page=1" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+sha=d[0]['sha'][:7] if d else '?'
+print(f'Last commit: {sha}')
+" 2>/dev/null || true
+      ;;
+    view)
+      local repo="" pr_num=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          *) pr_num="$1"; shift ;;
+        esac
+      done
+      [[ -n "$repo" ]]   || die "gh pr view: --repo required"
+      [[ -n "$pr_num" ]] || die "Usage: gh pr view <number> --repo owner/repo"
+      local out http_code
+      out=$(req GET "/repos/${repo}/pulls/${pr_num}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/pulls/${pr_num}")
+      err_check "$http_code" "$out"
+      echo "$out" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['title'])
+print('─'*60)
+print(d['body'] or '(no description)')
+print('─'*60)
+print(f'Author: @{d[\"user\"][\"login\"]}  Draft: {d.get(\"draft\",False)}')
+print(f'Branch: {d[\"head\"][\"ref\"]} → {d[\"base\"][\"ref\"]}')
+print(f'State: {d[\"state\"]}  Mergeable: {d.get(\"mergeable\",\"?\")}')
+print(f'URL: {d[\"html_url\"]}')
+"
+      ;;
+    *) echo "gh pr $sub: not implemented (try: list, checks, view)" ;;
+  esac
+}
+
+cmd_repo() {
+  local sub="${1:-}"; shift || die "Usage: gh-wrapper repo <subcommand>"
+  case "$sub" in
+    list)
+      local user="${1:-}"; shift || true
+      local out http_code
+      local endpoint="${user:+/users/${user}/repos}"; [[ -z "$endpoint" ]] && endpoint="/user/repos"
+      out=$(req GET "$endpoint?per_page=20&sort=pushed")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}${endpoint}?per_page=20&sort=pushed")
+      err_check "$http_code" "$out"
+      echo "$out" | python3 -c "
+import sys,json
+for r in json.load(sys.stdin):
+    star='★' if r['stargazers_count']>0 else ' '
+    print(f'  {star} {r[\"full_name\"]}  {\"private\" if r[\"private\"] else \"public\"}  ↑{r[\"pushed_at\"][:10]}  ★{r[\"stargazers_count\"]}  fork:{r[\"fork\"]}')
+"
+      ;;
+    view)
+      local repo=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      [[ -n "$repo" ]] || die "gh repo view: --repo required"
+      local out http_code
+      out=$(req GET "/repos/${repo}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}")
+      err_check "$http_code" "$out"
+      echo "$out" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['full_name'])
+print('─'*60)
+print(d['description'] or '(no description)')
+print(f'Language: {d.get(\"language\",\"?\")}  Stars: {d[\"stargazers_count\"]}  Forks: {d[\"forks_count\"]}')
+print(f'Subscribers: {d[\"subscribers_count\"]}  Watchers: {d[\"watchers_count\"]}')
+print(f'Open issues: {d[\"open_issues_count\"]}  Default branch: {d[\"default_branch\"]}')
+print(f'Created: {d[\"created_at\"][:10]}  Pushed: {d[\"pushed_at\"][:10]}')
+print(f'License: {d.get(\"license\",{}).get(\"name\",\"none\")}')
+print(f'URL: {d[\"html_url\"]}')
+"
+      ;;
+    *) echo "gh repo $sub: not implemented (try: list, view)" ;;
+  esac
+}
+
+cmd_run() {
+  local sub="${1:-}"; shift || die "Usage: gh-wrapper run <subcommand>"
+  case "$sub" in
+    list)
+      local repo="" limit="10"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          --limit) limit="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      [[ -n "$repo" ]] || die "gh run list: --repo required"
+      local out http_code
+      out=$(req GET "/repos/${repo}/actions/runs?per_page=${limit}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/actions/runs?per_page=${limit}")
+      err_check "$http_code" "$out"
+      echo "$out" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 for r in d.get('workflow_runs',[]):
-    status = r.get('conclusion') or r.get('status','?')
-    print(r['name']+' #'+str(r['run_number'])+' ['+status+'] '+r['head_branch'])
+    st=r.get('conclusion') or r.get('status','?')
+    print(f'  [{st:10}] {r[\"name\"]} #{r[\"run_number\"]}  {r[\"head_branch\"]}  @{r[\"actor\"][\"login\"]}  {r[\"updated_at\"][:16].replace(\"T\",\" \")}')
 "
-        ;;
-      view)
-        RUN_ID="" REPO=""
-        while [[ $# -gt 0 ]]; do
-          case "$1" in
-            --repo) REPO="$2"; shift 2 ;;
-            --log-failed) echo "Tip: gh api /repos/$REPO/actions/runs/$RUN_ID/logs" && shift ;;
-            *) RUN_ID="$1"; shift ;;
-          esac
-        done
-        [ -z "$REPO" ] && echo "Error: --repo required" && exit 1
-        curl -s -H "$AUTH" "${API}/repos/${REPO}/actions/runs/${RUN_ID}" | python3 -c "
+      ;;
+    view)
+      local repo="" run_id=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --repo) repo="$2"; shift 2 ;;
+          *) run_id="$1"; shift ;;
+        esac
+      done
+      [[ -n "$repo" ]]  || die "gh run view: --repo required"
+      [[ -n "$run_id" ]] || die "Usage: gh run view <id> --repo owner/repo"
+      local out http_code
+      out=$(req GET "/repos/${repo}/actions/runs/${run_id}")
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" "${API_BASE}/repos/${repo}/actions/runs/${run_id}")
+      err_check "$http_code" "$out"
+      echo "$out" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-print('name:   '+str(d.get('name')))
-print('run:    #'+str(d.get('run_number')))
-print('status: '+str(d.get('status'))+' / '+str(d.get('conclusion')))
-print('branch: '+str(d.get('head_branch')))
-print('actor:  '+str(d.get('actor',{}).get('login')))
-print('event:  '+str(d.get('event')))
-print('url:    '+str(d.get('html_url')))
+print(f'Name:    {d.get(\"name\")}')
+print(f'Run:     #{d.get(\"run_number\")}')
+print(f'Status:  {d.get(\"status\")} / {d.get(\"conclusion\")}')
+print(f'Branch:  {d.get(\"head_branch\")}')
+print(f'Actor:   @{d.get(\"actor\",{{}}).get(\"login\")}')
+print(f'Event:   {d.get(\"event\")}')
+print(f'URL:     {d.get(\"html_url\")}')
+# List jobs
 "
-        ;;
-      *) echo "gh run $sub: not implemented" ;;
-    esac
-    ;;
+      # Also fetch jobs for this run
+      local jobs_out
+      jobs_out=$(req GET "/repos/${repo}/actions/runs/${run_id}/jobs")
+      echo -e "\n${BLD}Jobs:${RST}"
+      echo "$jobs_out" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for j in d.get('jobs',[]):
+    st=j.get('conclusion') or j.get('status','?')
+    print(f'  [{st:10}] {j[\"name\"]}  {j.get(\"started_at\",\"\")[:16].replace(\"T\",\" \")}')
+" 2>/dev/null || true
+      ;;
+    *) echo "gh run $sub: not implemented (try: list, view)" ;;
+  esac
+}
 
-  *) echo "gh $cmd: not supported in wrapper" ;;
+# ── Usage ────────────────────────────────────────────────────────────────────
+usage() {
+  echo "gh-wrapper — GitHub REST API wrapper (no gh CLI needed)"
+  echo ""
+  echo "Usage: gh-wrapper <command> [subcommand] [flags]"
+  echo ""
+  echo "Commands:"
+  echo "  auth status              Show authenticated user"
+  echo "  auth logout              Clear token from environment"
+  echo "  api <path> [curl opts]   Call any GitHub REST API endpoint"
+  echo "  issue list  --repo o/r    List issues"
+  echo "  issue view  <n> --repo o/r"
+  echo "  issue create --repo o/r --title '...'"
+  echo "  pr list     --repo o/r    List pull requests"
+  echo "  pr view     <n>  --repo o/r"
+  echo "  pr checks   <n>  --repo o/r"
+  echo "  repo list   [user]        List user repos"
+  echo "  repo view   --repo o/r"
+  echo "  run list    --repo o/r    List workflow runs"
+  echo "  run view    <id> --repo o/r"
+  echo ""
+  echo "Environment:"
+  echo "  GITHUB_TOKEN   GitHub Personal Access Token (required)"
+  echo "  ~/.config/gh-wrapper/config  Optional config file"
+  echo ""
+  echo "Examples:"
+  echo "  export GITHUB_TOKEN=gho_..."
+  echo "  gh-wrapper auth status"
+  echo "  gh-wrapper issue list --repo owner/repo --state open --limit 30"
+  echo "  gh-wrapper api /repos/owner/repo/contents/README.md"
+  exit 1
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+load_config
+CMD="${1:-}"; shift || true
+
+case "$CMD" in
+  auth|api|issue|pr|repo|run) "cmd_$CMD" "$@" ;;
+  --debug)
+    set -x
+    "cmd_${1:-}" "$@" 2>&1
+    ;;
+  *) usage ;;
 esac
